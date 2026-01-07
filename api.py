@@ -3,41 +3,66 @@ import pickle
 import json
 import shap
 import logging
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security.api_key import APIKeyHeader, APIKey
 from pydantic import BaseModel, Field
 from typing import Optional
+from starlette.status import HTTP_403_FORBIDDEN
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- SÉCURITÉ (C19) ---
+API_KEY_NAME = "access_token"
+API_KEY = os.getenv("API_KEY", "secret-token-12345")
+
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == API_KEY:
+        return api_key_header
+    else:
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN, detail="Accès refusé : Clé API invalide ou manquante."
+        )
 
 app = FastAPI(
     title="API Scoring Crédit",
     description="API de prédiction du risque de défaut de paiement pour les conseillers clientèle."
 )
 
-# Chargement du modèle et des artefacts au démarrage
-model = None
+# Chargement du Pipeline et des artefacts au démarrage
+pipeline = None
 artifacts = None
 explainer = None
+model = None # Pour SHAP
 
 try:
-    logger.info("Chargement du modèle et des artefacts...")
-    with open("xgb_model.pkl", "rb") as f:
-        model = pickle.load(f)
+    logger.info("Chargement du pipeline et des artefacts...")
+    
+    # Chargement du Pipeline complet (Imputer -> Scaler -> Model)
+    with open("pipeline.pkl", "rb") as f:
+        pipeline = pickle.load(f)
+        
+    # Extraction du modèle interne pour SHAP
+    model = pipeline.named_steps['model']
     
     with open("preprocessing_artifacts.json", "r") as f:
         artifacts = json.load(f)
         
-    # Initialisation de l'explainer SHAP
+    # Initialisation de l'explainer SHAP sur le modèle XGBoost interne
+    # Note: SHAP a besoin des données transformées, c'est la partie délicate
+    # On utilisera un TreeExplainer simple
     explainer = shap.TreeExplainer(model)
-    logger.info("Modèle et artefacts chargés avec succès.")
+    
+    logger.info("Pipeline et artefacts chargés avec succès.")
 except FileNotFoundError as e:
     logger.error(f"ERREUR CRITIQUE : {e}")
 except Exception as e:
     logger.error(f"ERREUR inattendue lors du chargement : {e}")
 
-# Définition du format des données attendues (Contrat d'interface)
 class ClientData(BaseModel):
     AMT_INCOME_TOTAL: float = Field(..., description="Revenus annuels totaux", gt=0)
     AMT_CREDIT: float = Field(..., description="Montant du crédit demandé", gt=0)
@@ -48,58 +73,50 @@ class ClientData(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "L'API est en ligne", "model_loaded": model is not None}
+    return {"status": "L'API est en ligne", "pipeline_loaded": pipeline is not None}
 
 @app.get("/health")
 def health_check():
-    """Endpoint de monitoring pour vérifier la santé de l'API."""
-    if model is None:
-        raise HTTPException(status_code=503, detail="Modèle non chargé")
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline non chargé")
     return {"status": "ok"}
 
 @app.post("/predict")
-def predict(client: ClientData):
-    if model is None or artifacts is None:
-        raise HTTPException(status_code=503, detail="Le modèle n'est pas chargé.")
+def predict(client: ClientData, api_key: APIKey = Depends(get_api_key)):
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Le pipeline n'est pas chargé.")
 
     try:
-        logger.info("Réception d'une demande de prédiction.")
-        
-        # 1. Conversion des données reçues en DataFrame
+        # 1. Création DataFrame
         input_data = client.dict()
         df = pd.DataFrame([input_data])
         
-        # 1.bis Correction des anomalies
+        # 1.bis Correction anomalies (obligatoire avant Pipeline)
         if 'DAYS_EMPLOYED' in df.columns:
              df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].replace(365243, float('nan'))
 
-        # 2. Prétraitement
-        for col, median_val in artifacts['medians'].items():
-            if col in df.columns:
-                df[col] = df[col].fillna(median_val)
-                if df[col].isnull().any():
-                    df[col] = df[col].fillna(median_val)
+        # 2. Prédiction via Pipeline (Gère Imputation + Scaling + Pred)
+        # On s'assure d'avoir les colonnes dans le bon ordre
+        cols = artifacts.get('final_columns', df.columns.tolist())
+        # Ajout colonnes manquantes si besoin (sécurité)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = float('nan')
+        df = df[cols]
         
-        # 3. Alignement des colonnes
-        df_final = pd.DataFrame(columns=artifacts['final_columns'])
-        for col in artifacts['final_columns']:
-            if col in df.columns:
-                df_final[col] = df[col]
-            else:
-                df_final[col] = 0
-        df_final = df_final.fillna(0)
+        probability = float(pipeline.predict_proba(df)[:, 1][0])
         
-        # 4. Prédiction
-        probability = float(model.predict_proba(df_final)[:, 1][0])
-        
-        # Seuil de décision métier (chargé depuis artifacts)
+        # Seuil
         threshold = artifacts.get('threshold', 0.5)
         prediction = int(probability > threshold)
         
-        logger.info(f"Prédiction effectuée : Proba={probability:.2f}, Seuil={threshold:.2f}")
-
-        # 5. Explicabilité (SHAP)
-        shap_values = explainer.shap_values(df_final)
+        # 3. Explicabilité (SHAP)
+        # Pour SHAP, il faut passer les données transformées (imputées/scalées)
+        # On utilise les étapes du pipeline pour transformer
+        preprocessor = Pipeline(pipeline.steps[:-1]) # Tout sauf le modèle
+        data_transformed = preprocessor.transform(df)
+        
+        shap_values = explainer.shap_values(data_transformed)
         
         if isinstance(shap_values, list):
             vals = shap_values[1][0] 
@@ -107,7 +124,7 @@ def predict(client: ClientData):
             vals = shap_values[0]
             
         feature_importance = {}
-        for i, col in enumerate(artifacts['final_columns']):
+        for i, col in enumerate(cols):
             feature_importance[col] = float(vals[i])
 
         return {
