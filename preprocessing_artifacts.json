@@ -1,0 +1,38 @@
+{
+    "features": [
+        "AMT_INCOME_TOTAL",
+        "AMT_CREDIT",
+        "AMT_ANNUITY",
+        "CNT_CHILDREN",
+        "DAYS_BIRTH",
+        "DAYS_EMPLOYED"
+    ],
+    "num_cols": [
+        "AMT_INCOME_TOTAL",
+        "AMT_CREDIT",
+        "AMT_ANNUITY",
+        "CNT_CHILDREN",
+        "DAYS_BIRTH",
+        "DAYS_EMPLOYED",
+        "TARGET"
+    ],
+    "cat_cols": [],
+    "medians": {
+        "AMT_INCOME_TOTAL": 147150.0,
+        "AMT_CREDIT": 513531.0,
+        "AMT_ANNUITY": 24903.0,
+        "CNT_CHILDREN": 0.0,
+        "DAYS_BIRTH": -15750.0,
+        "DAYS_EMPLOYED": -1648.0,
+        "TARGET": 0.0
+    },
+    "final_columns": [
+        "AMT_INCOME_TOTAL",
+        "AMT_CREDIT",
+        "AMT_ANNUITY",
+        "CNT_CHILDREN",
+        "DAYS_BIRTH",
+        "DAYS_EMPLOYED"
+    ],
+    "threshold": 0.5665318965911865
+}
